@@ -165,13 +165,25 @@ def create_datasets(config, rank):
         print("Loading vector data...")
         print("=" * 60)
 
-    # Load vector data
+    # ⭐ NEW: Define validity ranges for each variable
+    # Riverflow is only valid from 1989-01-01 onwards
+    train_start = datetime.strptime(config.train_start, '%Y-%m-%d')
+    val_end = datetime.strptime(config.val_end, '%Y-%m-%d')
+    riverflow_valid_start = datetime(1989, 1, 1)
+
+    variable_validity_ranges = {
+        'evaporation': (train_start, val_end),  # Full range 1970-2015
+        'discharge_vol': (riverflow_valid_start, val_end),  # Only 1989-2015
+    }
+
+    # Load vector data with per-variable validity ranges
     vector_data, time_vec, catchment_ids, var_names = load_vector_data_from_parquet(
         config.vector_file,
         variables=['evaporation', 'discharge_vol'],
-        start=datetime.strptime(config.train_start, '%Y-%m-%d'),
-        end=datetime.strptime(config.val_end, '%Y-%m-%d'),  # Load all data
+        start=train_start,
+        end=val_end,  # Load all data
         nan_ratio=0.05,
+        variable_validity_ranges=variable_validity_ranges,  # ⭐ NEW
     )
 
     # Extract modalities

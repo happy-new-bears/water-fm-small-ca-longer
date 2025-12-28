@@ -15,12 +15,13 @@ def interpolate_features(
     end: datetime,
     nan_ratio: float,
     log_level: int = logging.INFO,
+    variable_validity_ranges: dict = None,  # ⭐ NEW: Per-variable validity date ranges
 ) -> pl.DataFrame:
     """
     Interpolate data in specified time range and nan ratio.
 
     Steps:
-    1. Filter catchments with a NaN ratio upper bound
+    1. Filter catchments with a NaN ratio upper bound (per-variable validity ranges)
     2. Interpolate missing values for selected catchments during time period
 
     Args:
@@ -29,6 +30,9 @@ def interpolate_features(
         end: End time of the time period (exclusive)
         nan_ratio: Maximum nan ratio allowed for selecting catchment
         log_level: Logging level
+        variable_validity_ranges: Dict mapping variable names to (valid_start, valid_end) tuples
+            Example: {'riverflow': (datetime(1989,1,1), datetime(2010,12,31))}
+            If None, all variables use (start, end)
 
     Returns:
         Preprocessed DataFrame
@@ -36,18 +40,51 @@ def interpolate_features(
     logger = logging.getLogger(__name__)
     logger.setLevel(log_level)
 
-    # Filter catchments with NaN ratio below threshold
-    time_expr = pl.col("date").ge(start) & pl.col("date").lt(end)
-    valid_cid = set(
-        cid[0]
-        for cid, g in df.filter(time_expr).group_by("ID")
-        if (g.null_count() < g.shape[0] * nan_ratio).to_numpy().all()
-    )
+    # ⭐ NEW: Per-variable NaN filtering
+    if variable_validity_ranges is None:
+        # Old behavior: all variables use same time range
+        time_expr = pl.col("date").ge(start) & pl.col("date").lt(end)
+        valid_cid = set(
+            cid[0]
+            for cid, g in df.filter(time_expr).group_by("ID")
+            if (g.null_count() < g.shape[0] * nan_ratio).to_numpy().all()
+        )
+    else:
+        # New behavior: check each variable in its valid range
+        all_catchments = set(df['ID'].unique().to_list())
+
+        for var_name, (valid_start, valid_end) in variable_validity_ranges.items():
+            if var_name not in df.columns:
+                continue
+
+            # Filter data to this variable's valid range
+            var_time_expr = pl.col("date").ge(valid_start) & pl.col("date").lt(valid_end)
+            var_df = df.filter(var_time_expr)
+
+            # Find catchments with acceptable NaN ratio for this variable
+            valid_for_var = set()
+            for cid, g in var_df.group_by("ID"):
+                var_col = g.select(var_name)
+                null_count = var_col.null_count()[0, 0]
+                total_count = g.shape[0]
+                if null_count < total_count * nan_ratio:
+                    valid_for_var.add(cid[0])
+
+            print(f"  {var_name}: {len(valid_for_var)}/{len(all_catchments)} catchments valid in {valid_start.date()} to {valid_end.date()}")
+
+            # Intersection: keep only catchments valid for ALL variables
+            all_catchments &= valid_for_var
+
+        valid_cid = all_catchments
+
+    if len(valid_cid) == 0:
+        raise ValueError("No valid catchments found after filtering NaN ratio")
 
     valid_df = df.filter(pl.col("ID").is_in(valid_cid))
     print(f"Found {valid_df['ID'].unique().len()} valid catchments after filtering NaN ratio")
 
-    # Interpolate missing values
+    # Interpolate missing values (only within valid ranges)
+    time_expr = pl.col("date").ge(start) & pl.col("date").lt(end)
     interpolate_df = (
         valid_df.group_by("ID")
         .map_groups(
@@ -68,6 +105,7 @@ def load_vector_data_from_parquet(
     start: datetime,
     end: datetime,
     nan_ratio: float = 0.05,
+    variable_validity_ranges: dict = None,  # ⭐ NEW: Per-variable validity ranges
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
     """
     Load vector data from parquet file and reshape to array format.
@@ -80,6 +118,9 @@ def load_vector_data_from_parquet(
         start: Start date (datetime object)
         end: End date (datetime object)
         nan_ratio: Maximum allowed NaN ratio for interpolation (default: 0.05)
+        variable_validity_ranges: Dict mapping variable names to (valid_start, valid_end) tuples
+            Example: {'riverflow': (datetime(1989,1,1), datetime(2010,12,31))}
+            Variables not in dict will be checked over entire (start, end) range
 
     Returns:
         data: np.ndarray of shape [num_days, num_catchments, num_vars]
@@ -117,9 +158,25 @@ def load_vector_data_from_parquet(
     if df_filtered_by_date.height == 0:
         raise ValueError(f"No vector data for date range {start} to {end} in {fpath}.")
 
-    # Interpolate missing values
+    # ⭐ NEW: Build complete validity ranges for all variables
+    if variable_validity_ranges is None:
+        validity_ranges = {}
+    else:
+        validity_ranges = variable_validity_ranges.copy()
+
+    # For variables not specified, use the full range
+    for var in variables:
+        if var not in validity_ranges:
+            validity_ranges[var] = (start, end)
+
+    print(f"Variable validity ranges:")
+    for var, (vs, ve) in validity_ranges.items():
+        print(f"  {var}: {vs.date()} to {ve.date()}")
+
+    # Interpolate missing values with per-variable validity checking
     df_processed = interpolate_features(
-        df_filtered_by_date, start, end, nan_ratio
+        df_filtered_by_date, start, end, nan_ratio,
+        variable_validity_ranges=validity_ranges
     ).sort(["date", "ID"])
 
     # Get variable names in order (excluding date and ID)
